@@ -12,6 +12,7 @@ rm "$output_file" || true
 zip -r "$output_file" . \
     -x '*egg-info*' \
     -x '*mypy_cache*' \
+    -x 'data/*' \
     -x '*pytest_cache*' \
     -x '*build*' \
     -x '*ipynb_checkpoints*' \
