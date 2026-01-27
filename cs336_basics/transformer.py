@@ -20,8 +20,6 @@ class Embedding(nn.Module):
         nn.init.trunc_normal_(self.weight, std=1.0)
 
     def forward(self, x):
-        # 替换 F.embedding(x, self.weight)
-        # 直接使用索引操作，PyTorch 支持用 LongTensor 进行索引
         return self.weight[x]
 
 
@@ -37,21 +35,29 @@ class RMSNorm(nn.Module):
         return (x_fp32 / rms).type_as(x) * self.weight
 
 
-# 手动实现 SiLU
 def silu(x):
     return x * torch.sigmoid(x)
 
 
+# === 修改点 1: 支持 SiLU 和 SwiGLU 切换 ===
 class FeedForward(nn.Module):
-    def __init__(self, d_model, d_ff):
+    def __init__(self, d_model, d_ff, ffn_type="swiglu"):
         super().__init__()
-        self.w1 = Linear(d_model, d_ff)
-        self.w2 = Linear(d_ff, d_model)
-        self.w3 = Linear(d_model, d_ff)
+        self.ffn_type = ffn_type
+        self.w1 = Linear(d_model, d_ff, bias=False)
+        self.w2 = Linear(d_ff, d_model, bias=False)
+
+        if ffn_type == "swiglu":
+            self.w3 = Linear(d_model, d_ff, bias=False)
+        # 如果是 silu，不需要 w3
 
     def forward(self, x):
-        # 替换 F.silu
-        return self.w2(silu(self.w1(x)) * self.w3(x))
+        if self.ffn_type == "swiglu":
+            return self.w2(silu(self.w1(x)) * self.w3(x))
+        elif self.ffn_type == "silu":
+            return self.w2(silu(self.w1(x)))
+        else:
+            raise ValueError(f"Unknown ffn_type: {self.ffn_type}")
 
 
 def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
@@ -67,12 +73,10 @@ def cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         B, T, V = logits.shape
         logits = logits.view(B * T, V)
         targets = targets.view(B * T)
-
     max_val = logits.max(dim=-1, keepdim=True).values
     logits_stable = logits - max_val
     log_sum_exp = torch.log(torch.sum(torch.exp(logits_stable), dim=-1, keepdim=True))
     log_probs = logits_stable - log_sum_exp
-
     N = logits.shape[0]
     target_log_probs = log_probs[torch.arange(N, device=logits.device), targets]
     return -target_log_probs.mean()
@@ -86,14 +90,12 @@ class RotaryPositionalEmbedding(torch.nn.Module):
         t = torch.arange(max_seq_len).float()
         freqs_outer = torch.outer(t, freqs)
         freqs_interleaved = freqs_outer.repeat_interleave(2, dim=-1)
-
         self.register_buffer("cos_cached", freqs_interleaved.cos().type(torch.float32))
         self.register_buffer("sin_cached", freqs_interleaved.sin().type(torch.float32))
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
         cos = self.cos_cached[token_positions]
         sin = self.sin_cached[token_positions]
-
         if x.ndim == 4 and cos.ndim == 3:
             cos = cos.unsqueeze(1)
             sin = sin.unsqueeze(1)
@@ -102,7 +104,6 @@ class RotaryPositionalEmbedding(torch.nn.Module):
                 ratio = x.shape[0] // cos.shape[0]
                 cos = cos.unsqueeze(1).expand(-1, ratio, -1, -1).reshape(x.shape)
                 sin = sin.unsqueeze(1).expand(-1, ratio, -1, -1).reshape(x.shape)
-
         return (x * cos) + (self._rotate_adjacent(x) * sin)
 
     def _rotate_adjacent(self, x: torch.Tensor):
@@ -112,6 +113,7 @@ class RotaryPositionalEmbedding(torch.nn.Module):
         return rotate_x.flatten(-2)
 
 
+# === 修改点 2: 传入 use_rope 参数 ===
 class MultiHeadSelfAttention(torch.nn.Module):
     def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float = 10000.0, use_rope: bool = True):
         super().__init__()
@@ -130,7 +132,6 @@ class MultiHeadSelfAttention(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor = None):
         batch_size, seq_len, _ = x.shape
-
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -150,30 +151,107 @@ class MultiHeadSelfAttention(torch.nn.Module):
         return self.output_proj(context)
 
 
+# === 修改点 3: 支持 Pre/Post Norm 和 LayerNorm Ablation ===
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, num_heads, d_ff, max_seq_len, theta=10000.0):
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        d_ff,
+        max_seq_len,
+        theta=10000.0,
+        use_rms_norm=True,
+        norm_mode="pre",
+        ffn_type="swiglu",
+        use_rope=True,
+    ):
         super().__init__()
-        self.ln1 = RMSNorm(d_model)
-        self.attn = MultiHeadSelfAttention(d_model, num_heads, max_seq_len, theta)
-        self.ln2 = RMSNorm(d_model)
-        self.ffn = FeedForward(d_model, d_ff)
+        self.use_rms_norm = use_rms_norm
+        self.norm_mode = norm_mode
+
+        if use_rms_norm:
+            self.ln1 = RMSNorm(d_model)
+            self.ln2 = RMSNorm(d_model)
+
+        self.attn = MultiHeadSelfAttention(d_model, num_heads, max_seq_len, theta, use_rope=use_rope)
+        self.ffn = FeedForward(d_model, d_ff, ffn_type=ffn_type)
 
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ffn(self.ln2(x))
+        if self.norm_mode == "pre":
+            # Pre-Norm: x = x + f(norm(x))
+            # 如果不使用 norm，则 x = x + f(x)
+
+            # Sublayer 1: Attention
+            residual = x
+            if self.use_rms_norm:
+                x = self.ln1(x)
+            x = residual + self.attn(x)
+
+            # Sublayer 2: FFN
+            residual = x
+            if self.use_rms_norm:
+                x = self.ln2(x)
+            x = residual + self.ffn(x)
+
+        elif self.norm_mode == "post":
+            # Post-Norm: x = norm(x + f(x))
+
+            # Sublayer 1: Attention
+            x = x + self.attn(x)
+            if self.use_rms_norm:
+                x = self.ln1(x)
+
+            # Sublayer 2: FFN
+            x = x + self.ffn(x)
+            if self.use_rms_norm:
+                x = self.ln2(x)
+
         return x
 
 
+# === 修改点 4: 将配置参数传入 Block ===
 class TransformerLM(nn.Module):
-    def __init__(self, vocab_size, d_model, num_layers, num_heads, d_ff, max_seq_len, theta=10000.0):
+    def __init__(
+        self,
+        vocab_size,
+        d_model,
+        num_layers,
+        num_heads,
+        d_ff,
+        max_seq_len,
+        theta=10000.0,
+        use_rms_norm=True,
+        norm_mode="pre",
+        ffn_type="swiglu",
+        use_rope=True,
+    ):
         super().__init__()
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
         self.token_embeddings = Embedding(vocab_size, d_model)
+
         self.layers = nn.ModuleList(
-            [TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta) for _ in range(num_layers)]
+            [
+                TransformerBlock(
+                    d_model,
+                    num_heads,
+                    d_ff,
+                    max_seq_len,
+                    theta,
+                    use_rms_norm=use_rms_norm,
+                    norm_mode=norm_mode,
+                    ffn_type=ffn_type,
+                    use_rope=use_rope,
+                )
+                for _ in range(num_layers)
+            ]
         )
-        self.ln_final = RMSNorm(d_model)
+
+        if use_rms_norm:
+            self.ln_final = RMSNorm(d_model)
+        else:
+            self.ln_final = nn.Identity()
+
         self.lm_head = Linear(d_model, vocab_size, bias=False)
 
     def forward(self, x):
@@ -185,68 +263,40 @@ class TransformerLM(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_p=None, eos_id=None):
-        """
-        生成序列的函数。
-        Args:
-            idx: (Batch, Seq_len) 输入的 token indices
-            max_new_tokens: 最大生成长度
-            temperature: Softmax 温度 (越低越保守，越高越随机)
-            top_p: Nucleus sampling 的概率阈值 (例如 0.9)
-            eos_id: 遇到此 token id 时提前停止
-        """
         for _ in range(max_new_tokens):
-            # 如果序列超过了上下文长度，进行截断
             idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len :]
-
-            # 前向传播获取 logits
             logits = self(idx_cond)
-            logits = logits[:, -1, :]  # 只取最后一个时间步 (B, V)
+            logits = logits[:, -1, :]
 
-            # 应用 Temperature
             if temperature > 0.0:
                 logits = logits / temperature
             else:
-                # 如果 temperature 为 0，退化为贪婪解码
                 _, idx_next = torch.topk(logits, k=1, dim=-1)
                 idx = torch.cat((idx, idx_next), dim=1)
                 if eos_id is not None and (idx_next == eos_id).all():
                     break
                 continue
 
-            # 应用 Top-p (Nucleus) Sampling
             if top_p is not None and top_p < 1.0:
-                # 1. 排序
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 sorted_probs = torch.softmax(sorted_logits, dim=-1)
-
-                # 2. 计算累积概率
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
-                # 3. 创建掩码：移除累积概率超过 top_p 的 token
-                # 我们需要保留第一个超过阈值的 token，所以将掩码向右移动一位
                 sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
-
-                # 4. 将掩码映射回原始 logits 的索引位置
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = float("-inf")
 
-            # 采样
             probs = torch.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
-
-            # 拼接
             idx = torch.cat((idx, idx_next), dim=1)
 
-            # 检查结束符 (通常只在 batch_size=1 时有效)
             if eos_id is not None and (idx_next == eos_id).all():
                 break
 
         return idx
 
 
-# Optimizer, Clipping, Schedule 保持不变，它们没有用到 F
 class AdamW(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
@@ -256,13 +306,11 @@ class AdamW(torch.optim.Optimizer):
         loss = None
         if closure is not None:
             loss = closure()
-
         for group in self.param_groups:
             lr = group["lr"]
             beta1, beta2 = group["betas"]
             eps = group["eps"]
             weight_decay = group["weight_decay"]
-
             for p in group["params"]:
                 if p.grad is None:
                     continue

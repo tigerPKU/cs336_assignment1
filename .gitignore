@@ -166,3 +166,4 @@ data/
 test_results.xml 
 **/log
 .vscode
+**/logs

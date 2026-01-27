@@ -318,24 +318,26 @@ However, it is good practice to include a brief summary of your implementation d
 **Implementation Details:**
 I implemented the complete training script in `train.py` that integrates the model, optimizer, scheduler, and data loader.
 
-* 
+
 **Configuration:** The script uses `argparse` to allow full control over hyperparameters (e.g., `batch_size`, `lr`, `vocab_size`) and system settings (`device`, `out_dir`).
 
 
-* 
+
 **Large Dataset Support:** Training and validation data are loaded using `np.memmap` to handle the memory constraints of large pretraining corpora.
 
 
-* 
+
 **Checkpointing:** The loop periodically serializes the model and optimizer state to the user-provided path.
 
 
-* 
-**Logging:** The script logs training loss, learning rate, and throughput (tokens/sec) to the console and optionally supports **Weights and Biases (WandB)** for external visualization of learning curves.
+
+**Logging:** The script logs training loss, learning rate, and throughput (tokens/sec) to the console and optionally supports 
+
+**Weights and Biases (WandB)** for external visualization of learning curves.
 
 
 
-## 6 Generating Text
+# 6 Generating Text
 
 ### Problem (decoding)
 
@@ -379,4 +381,103 @@ I created a standalone script `scripts/generate.py` that loads the trained model
 **Sample Output:**
 Using the model trained on TinyStories (approx. 5000 steps) with `temperature=0.7`, `top_p=0.9`, and the prompt "Once upon a time":
 
-> Once upon a time, there was a little girl named Amy. She was a very persistent girl who always wanted to play. One day, she found a big package in her yard. She was very curious about what was inside the package...
+> Once upon a time, there was a little girl named Amy. She was a very obedient girl who always listened to her mom and dad. One day, her mom said, "Amy, you need to be very careful with the things you love." Amy did not listen. She wanted to listen to her mom and dad.
+<|endoftext|>
+
+# Section 7: Experiments
+
+## 7.2 Hyperparameter Tuning
+
+### Problem (learning_rate)
+
+**Deliverable: Learning curve comparison**
+
+![alt text](<W&B Chart 2026_1_28 00_01_18.png>)
+
+**Analysis:**
+
+To identify the optimal learning rate and understand the stability boundaries of the model, I performed a sweep over the values . The results are analyzed as follows:
+
+1. **Under-confidence ():** The pink curve shows the slowest convergence. By step 5000, the loss is still around **2.1**, significantly higher than well-tuned models. The step size is too small to traverse the loss landscape efficiently within the compute budget.
+2. **Optimal Performance ( & ):**
+* The **Red** learning rate appears to be the most effective, achieving the fastest initial descent and the lowest final validation loss ( **1.60**).
+* The **(Green)** rate is also highly effective and stable, closely trailing the optimal performance.
+
+
+3. **The Edge of Stability ():**
+* The **(Blue)** curve demonstrates the concept of the "Edge of Stability." While it did not cause the model to diverge to NaN, it performed worse ( 1.7) than the  run.
+* This indicates that the learning rate is slightly too high, preventing the model from settling into the sharpest minima and likely causing it to oscillate around the optimal solution. The optimal rate is found just before this point of degradation.
+
+
+
+---
+
+### Problem (batch_size_experiment)
+
+**Deliverable: Learning curve comparison**
+
+![alt text](<W&B Chart 2026_1_28 00_24_59.png>)
+
+**Analysis:**
+
+I compared training with a batch size of 1 versus a batch size of 64 (keeping other hyperparameters constant).
+
+* **Batch Size 64 (Red/Orange):** This configuration is stable and efficient. The gradients are estimated over a larger number of samples, providing a lower-variance estimate of the true gradient. This allows the model to take consistent steps toward the minimum, resulting in a smooth loss curve and a low final loss ( 1.6).
+* **Batch Size 1 (Pink):** This configuration performs poorly. The loss curve is extremely jagged and noisy (High Variance). Because the gradient is estimated from a single sample, it contains significant noise, causing the optimization trajectory to be chaotic. The final loss ( 2.9) is much higher, proving that small batch sizes (without gradient accumulation) lead to poor convergence stability.
+
+---
+
+## 7.3 Ablation Studies
+
+### Problem (ablation)
+
+**Deliverable: Learning curve comparison of architecture changes**
+
+![alt text](<W&B Chart 2026_1_28 00_26_39.png>)
+
+**Analysis:**
+
+I compared the "Standard Baseline" against several architectural variations. The results at step 5000 highlight the importance of each component:
+
+1. **Baseline (Pre-Norm, RMSNorm, SwiGLU, RoPE):** This configuration yields the best performance (Loss  1.6 - 1.7), confirming that the modern Transformer recipe is highly effective.
+2. **No RMSNorm (`ablation_no_rmsnorm`):** This was the most detrimental change (Loss  2.2). Without Layer Normalization, the network suffers from internal covariate shift and potentially exploding/vanishing gradients, making deep training significantly harder.
+3. **No Positional Embeddings (`ablation_no_rope`):** Removing RoPE degraded performance (Loss  1.85). Without explicit positional encoding, the self-attention mechanism is permutation invariant and acts like a "bag of words," losing critical sequential structure required for language modeling.
+4. **SiLU instead of SwiGLU (`ablation_silu`):** Replacing SwiGLU with a standard SiLU activation resulted in a higher loss ( 1.8). This validates findings (e.g., from PaLM/LLaMA) that Gated Linear Units provide better inductive biases and capacity for LLMs.
+5. **Post-Norm (`ablation_post_norm`):** This performed similarly to or slightly worse than the Pre-Norm baseline. While Post-Norm was the original design, Pre-Norm is generally preferred in modern LLMs for better gradient flow and training stability without warm-up.
+
+---
+
+## 7.4 OpenWebText Experiment
+
+### Problem (main_experiment)
+
+**Deliverable: Learning curve comparison**
+
+![alt text](<W&B Chart 2026_1_28 00_01_18-1.png>)
+
+**Comparison of Losses:**
+
+* **TinyStories Baseline Loss:**  1.6 - 1.7
+* **OpenWebText (OWT) Loss:**  4.8
+
+**Interpretation:**
+The loss on OpenWebText is drastically higher than on TinyStories, but this **does not** imply a model bug. It reflects the fundamental difference in **Data Entropy**:
+
+* **TinyStories** has a vocabulary of only ~10k and uses simple, repetitive grammar suitable for children. It has low information entropy, making prediction easy.
+* **OpenWebText** represents the complexity of the real internet (>50k vocabulary, complex syntax, code, diverse topics). The uncertainty (entropy) of the next token is naturally much higher, leading to a higher cross-entropy floor.
+
+**Deliverable: Generated Text Analysis**
+
+**Generated Text Sample:**
+
+> Once upon a time of my life, I started talking about something else I had to talk to for myself and talk to me about my work. I have always wanted to write my life, because I was like, ‘I have a life.’
+<|endoftext|>
+
+**Fluency & Quality Analysis:**
+The generated text from the OWT model is largely **incoherent**. While it produces valid English words, it fails to form meaningful sentences or maintain a consistent topic.
+
+**Why is it worse than TinyStories?**
+Despite using the same architecture and training iterations:
+
+1. **Underfitting (Capacity Gap):** A ~20M parameter model is sufficient to memorize the simple patterns of TinyStories, but it is woefully insufficient to model the vast complexity of the OpenWebText distribution.
+2. **Insufficient Training:** 5000 steps on OWT (which is hundreds of GBs) means the model has seen a negligible fraction of the dataset. It has not converged, whereas the TinyStories model has likely seen its smaller dataset multiple times (or a significant portion of it). The model is severely undertrained for this data distribution.
