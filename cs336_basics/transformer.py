@@ -168,6 +168,7 @@ class TransformerLM(nn.Module):
     def __init__(self, vocab_size, d_model, num_layers, num_heads, d_ff, max_seq_len, theta=10000.0):
         super().__init__()
         self.vocab_size = vocab_size
+        self.max_seq_len = max_seq_len
         self.token_embeddings = Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList(
             [TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta) for _ in range(num_layers)]
@@ -181,6 +182,68 @@ class TransformerLM(nn.Module):
             x = layer(x)
         x = self.ln_final(x)
         return self.lm_head(x)
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_p=None, eos_id=None):
+        """
+        生成序列的函数。
+        Args:
+            idx: (Batch, Seq_len) 输入的 token indices
+            max_new_tokens: 最大生成长度
+            temperature: Softmax 温度 (越低越保守，越高越随机)
+            top_p: Nucleus sampling 的概率阈值 (例如 0.9)
+            eos_id: 遇到此 token id 时提前停止
+        """
+        for _ in range(max_new_tokens):
+            # 如果序列超过了上下文长度，进行截断
+            idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len :]
+
+            # 前向传播获取 logits
+            logits = self(idx_cond)
+            logits = logits[:, -1, :]  # 只取最后一个时间步 (B, V)
+
+            # 应用 Temperature
+            if temperature > 0.0:
+                logits = logits / temperature
+            else:
+                # 如果 temperature 为 0，退化为贪婪解码
+                _, idx_next = torch.topk(logits, k=1, dim=-1)
+                idx = torch.cat((idx, idx_next), dim=1)
+                if eos_id is not None and (idx_next == eos_id).all():
+                    break
+                continue
+
+            # 应用 Top-p (Nucleus) Sampling
+            if top_p is not None and top_p < 1.0:
+                # 1. 排序
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+
+                # 2. 计算累积概率
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+                # 3. 创建掩码：移除累积概率超过 top_p 的 token
+                # 我们需要保留第一个超过阈值的 token，所以将掩码向右移动一位
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+
+                # 4. 将掩码映射回原始 logits 的索引位置
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = float("-inf")
+
+            # 采样
+            probs = torch.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+
+            # 拼接
+            idx = torch.cat((idx, idx_next), dim=1)
+
+            # 检查结束符 (通常只在 batch_size=1 时有效)
+            if eos_id is not None and (idx_next == eos_id).all():
+                break
+
+        return idx
 
 
 # Optimizer, Clipping, Schedule 保持不变，它们没有用到 F
