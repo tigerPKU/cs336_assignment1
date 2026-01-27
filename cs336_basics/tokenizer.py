@@ -2,19 +2,19 @@ import regex as re
 import os
 import json
 import multiprocessing
+import gc
+import shutil
 from typing import List, Dict, Tuple, Iterable, Iterator
 from collections import Counter, defaultdict
 from tqdm import tqdm
+from pathlib import Path
 
 # GPT-2 Regex Pattern
 GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 
 def get_stats(vocab: Dict[Tuple[bytes, ...], int]) -> Dict[Tuple[bytes, bytes], int]:
-    """
-    统计当前词表中所有相邻字节对的频率。
-    主要用于 Tokenizer 在推理阶段（_bpe）对单个单词进行统计。
-    """
+    """统计相邻字节对频率"""
     pairs = defaultdict(int)
     for word, freq in vocab.items():
         for i in range(len(word) - 1):
@@ -24,86 +24,198 @@ def get_stats(vocab: Dict[Tuple[bytes, ...], int]) -> Dict[Tuple[bytes, bytes], 
 
 
 def _pretokenize_chunk(args):
-    """
-    Worker function: 接收字符串列表，独立处理每个片段，不进行拼接。
-    """
-    text_fragments, pattern_str = args
-    # 在 Worker 内部编译正则，确保序列化安全
+    """Worker: 处理文本片段列表并返回词频"""
+    fragments, pattern_str = args
     pat = re.compile(pattern_str)
-
     counts = Counter()
-    for fragment in text_fragments:
-        # 对每个片段单独跑正则，保证片段间的边界不被污染
-        for token in pat.findall(fragment):
-            # 转换为 bytes tuple: "the" -> (b't', b'h', b'e')
+
+    # fragments 是一个 list[str]，每个 str 都是一个完整的连续文本块
+    # 我们对每个块单独进行正则切分
+    for text in fragments:
+        for token in pat.findall(text):
             byte_tuple = tuple([bytes([b]) for b in token.encode("utf-8")])
             counts[byte_tuple] += 1
     return counts
 
 
 def train_bpe(
-    input_path: str, vocab_size: int, special_tokens: List[str]
+    input_path: str,
+    vocab_size: int,
+    special_tokens: List[str],
+    chunk_size_threshold: int = 10 * 1024 * 1024,  # 10MB accumulate buffer
+    temp_dir: str = "temp_bpe_stats",
 ) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
     """
-    使用优化的增量更新算法训练 BPE Tokenizer。
+    修复版 BPE 训练：支持流式读取 + 正确处理跨行 Token (如 \\n\\n)
     """
-    # 1. 读取数据
-    print(f"Reading data from {input_path}...")
-    with open(input_path, "r", encoding="utf-8") as f:
-        text = f.read()
 
-    # 2. 预处理：处理特殊 Token 并切分
-    print("Pre-tokenizing...")
+    # === 1. 环境准备 ===
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir)
+
+    print(f"[Map Phase] Reading data from {input_path}...")
+
     special_token_set = set(special_tokens) if special_tokens else set()
     if special_tokens:
         sorted_special = sorted(special_tokens, key=len, reverse=True)
-        special_pattern = "(" + "|".join(re.escape(s) for s in sorted_special) + ")"
-        splits = re.split(special_pattern, text)
+        # 使用捕获组 (...) 以便 split 后保留分隔符
+        special_pattern_str = "(" + "|".join(re.escape(s) for s in sorted_special) + ")"
+        special_re = re.compile(special_pattern_str)
     else:
-        splits = [text]
+        special_re = None
 
-    training_fragments = [s for s in splits if s and s not in special_token_set]
+    # === 2. Map 阶段：智能分块读取 ===
+    num_processes = max(1, multiprocessing.cpu_count() - 1)
+    pool = multiprocessing.Pool(num_processes)
 
-    # 多进程统计预分词后的词频
-    combined_counts = Counter()
-    if len(text) < 5 * 1024 * 1024:
-        # 小文件直接处理
-        combined_counts = _pretokenize_chunk((training_fragments, GPT2_SPLIT_PATTERN))
-    else:
-        # 大文件多进程处理
-        num_processes = max(1, multiprocessing.cpu_count() - 1)
-        chunk_size = len(training_fragments) // num_processes + 1
-        chunks = [training_fragments[i : i + chunk_size] for i in range(0, len(training_fragments), chunk_size)]
-        args = [(chunk, GPT2_SPLIT_PATTERN) for chunk in chunks if chunk]
-        with multiprocessing.Pool(num_processes) as pool:
-            results = pool.map(_pretokenize_chunk, args)
+    # 用于累积即将发送给 Worker 的完整片段列表
+    batch_fragments = []
+    current_batch_size = 0
+
+    # 用于累积当前正在读取的连续文本（尚未遇到 Special Token）
+    # 使用 list[str] 比不断 string += string 更高效
+    current_text_builder = []
+    current_text_len = 0
+
+    chunk_idx = 0
+
+    def flush_batch():
+        """将积累的 batch_fragments 发送给 Workers 并落盘"""
+        nonlocal chunk_idx, batch_fragments, current_batch_size
+        if not batch_fragments:
+            return
+
+        # 切分任务
+        num_tasks = min(len(batch_fragments), num_processes * 4)
+        task_size = len(batch_fragments) // num_tasks + 1
+        chunks = [batch_fragments[i : i + task_size] for i in range(0, len(batch_fragments), task_size)]
+
+        args = [(c, GPT2_SPLIT_PATTERN) for c in chunks]
+        results = pool.map(_pretokenize_chunk, args)
+
+        # 合并结果
+        total_counts = Counter()
         for res in results:
-            combined_counts.update(res)
+            total_counts.update(res)
 
+        # 序列化并落盘
+        serializable_counts = {"".join(b.hex() for b in k): v for k, v in total_counts.items()}
+
+        with open(os.path.join(temp_dir, f"part_{chunk_idx}.json"), "w") as tf:
+            json.dump(serializable_counts, tf)
+
+        chunk_idx += 1
+        batch_fragments = []
+        current_batch_size = 0
+        gc.collect()
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        pbar = tqdm(desc="Processing Stream")
+
+        for line in f:
+            pbar.update(len(line))
+
+            # 如果没有特殊 Token，直接把行拼接到 builder
+            if not special_re:
+                current_text_builder.append(line)
+                current_text_len += len(line)
+            else:
+                # 如果有特殊 Token，进行切分
+                parts = special_re.split(line)
+                # re.split 返回 [text, special, text, special, text...]
+
+                # 第一部分：属于当前正在累积的 fragment
+                if parts[0]:
+                    current_text_builder.append(parts[0])
+                    current_text_len += len(parts[0])
+
+                # 如果 split 产生了多个部分，说明中间遇到了 Special Token
+                if len(parts) > 1:
+                    # 1. 完成当前的 fragment
+                    full_frag = "".join(current_text_builder)
+                    if full_frag:
+                        batch_fragments.append(full_frag)
+                        current_batch_size += len(full_frag)
+
+                    # 重置 builder
+                    current_text_builder = []
+                    current_text_len = 0
+
+                    # 2. 处理中间的部分
+                    # parts[1], parts[3]... 是 Special Tokens (跳过)
+                    # parts[2], parts[4]... 是 文本片段 (直接作为新 fragment)
+                    for i in range(2, len(parts), 2):
+                        frag = parts[i]
+                        # 如果这不是最后一部分，它就是一个完整的被 Special Token 包围的片段
+                        if i < len(parts) - 1:
+                            if frag:
+                                batch_fragments.append(frag)
+                                current_batch_size += len(frag)
+                        else:
+                            # 最后一部分：是下一段文本的开始，放入 builder
+                            if frag:
+                                current_text_builder.append(frag)
+                                current_text_len += len(frag)
+
+            # 检查是否需要 Flush 到 Worker
+            # 条件：Current Builder 太大（防止内存无限增长） 或 Batch 太大
+            if current_text_len > chunk_size_threshold:
+                # 强制切断当前文本（虽然可能切断单词，但 10MB 切一次概率很低，且是大文件训练所必需）
+                full_frag = "".join(current_text_builder)
+                batch_fragments.append(full_frag)
+                current_batch_size += len(full_frag)
+                current_text_builder = []
+                current_text_len = 0
+
+            if current_batch_size > chunk_size_threshold:
+                flush_batch()
+
+        # 循环结束，处理剩余数据
+        if current_text_builder:
+            batch_fragments.append("".join(current_text_builder))
+
+        flush_batch()
+        pbar.close()
+
+    print(f"\n[Map Phase] Complete. Stats saved to {chunk_idx} files.")
+
+    # === 3. Reduce 阶段：从硬盘加载并合并 ===
+    print("[Reduce Phase] Merging stats from disk...")
+    combined_counts = Counter()
+
+    temp_files = list(Path(temp_dir).glob("*.json"))
+    for tf in tqdm(temp_files, desc="Merging Files"):
+        with open(tf, "r") as f:
+            data = json.load(f)
+            for k_hex, freq in data.items():
+                raw_bytes = bytes.fromhex(k_hex)
+                # 还原为 tuple
+                key_tuple = tuple(bytes([b]) for b in raw_bytes)
+                combined_counts[key_tuple] += freq
+
+    shutil.rmtree(temp_dir)
     print(f"Number of unique pre-tokens: {len(combined_counts)}")
 
-    # === 初始化 BPE 数据结构 ===
-    # vocab_list: 存储单词的 Token ID 列表，例如 [[id1, id2], [id3, id4]]
+    # === 4. BPE 训练 (核心逻辑) ===
     vocab_list: List[List[int]] = []
-    # word_counts: 对应单词的频率
     word_counts: List[int] = []
 
-    # 初始化基础词表 (0-255 + Special Tokens)
     vocab_id_map = {i: bytes([i]) for i in range(256)}
     next_id = 256
     for st in special_tokens:
         vocab_id_map[next_id] = st.encode("utf-8")
         next_id += 1
 
-    # 将统计结果填入列表
     for word_bytes_tuple, freq in combined_counts.items():
         ids = [int(b[0]) for b in word_bytes_tuple]
         vocab_list.append(ids)
         word_counts.append(freq)
 
-    # stats: 记录相邻字节对的频率 (id1, id2) -> freq
+    del combined_counts
+    gc.collect()
+
     stats = defaultdict(int)
-    # indices: 倒排索引，记录字节对出现在哪些单词中 (id1, id2) -> {word_idx, ...}
     indices = defaultdict(set)
 
     print("Building initial stats...")
@@ -118,40 +230,31 @@ def train_bpe(
     num_merges = vocab_size - next_id
     print(f"Starting BPE loop. Need {num_merges} merges...")
 
-    # === BPE 训练主循环 ===
     for i in tqdm(range(num_merges)):
         if not stats:
             break
 
-        # 选择最佳合并对：
-        # 1. 频率最高
-        # 2. 频率相同时，选择字节序（lexicographically）最大的
+        # Tie-breaking: 频率最高 > 字节序最大
         best_pair = max(stats, key=lambda p: (stats[p], vocab_id_map[p[0]], vocab_id_map[p[1]]))
 
-        # 记录 Merge 操作
         p0, p1 = best_pair
         merges.append((vocab_id_map[p0], vocab_id_map[p1]))
 
-        # 生成新 Token
         new_token_bytes = vocab_id_map[p0] + vocab_id_map[p1]
         vocab_id_map[next_id] = new_token_bytes
         new_token_id = next_id
         next_id += 1
 
-        # === 增量更新 ===
-        # 获取所有可能包含 best_pair 的单词索引 (indices 包含的是超集)
         words_to_update = indices[best_pair]
 
         for word_idx in list(words_to_update):
             word = vocab_list[word_idx]
 
-            # 扫描单词，检查是否存在 best_pair 并执行合并
             i = 0
             n = len(word)
             has_merge = False
             new_word = []
 
-            # 构建新单词
             while i < n:
                 if i < n - 1 and word[i] == p0 and word[i + 1] == p1:
                     new_word.append(new_token_id)
@@ -161,30 +264,24 @@ def train_bpe(
                     new_word.append(word[i])
                     i += 1
 
-            # 如果该单词中并没有实际发生合并（可能是 indices 中的过期索引），直接跳过
             if not has_merge:
                 continue
 
-            # === 更新统计信息 ===
             freq = word_counts[word_idx]
 
-            # 1. 扣除旧邻居的频率 (Old Pairs)
             for j in range(len(word) - 1):
                 pair = (word[j], word[j + 1])
                 stats[pair] -= freq
                 if stats[pair] == 0:
                     del stats[pair]
 
-            # 2. 加上新邻居的频率 (New Pairs)
             for j in range(len(new_word) - 1):
                 pair = (new_word[j], new_word[j + 1])
                 stats[pair] += freq
                 indices[pair].add(word_idx)
 
-            # 更新词表中的单词
             vocab_list[word_idx] = new_word
 
-        # 清理 best_pair
         if best_pair in stats:
             del stats[best_pair]
 
@@ -192,20 +289,15 @@ def train_bpe(
     return vocab_id_map, merges
 
 
+# === Tokenizer 类 (保持缓存优化) ===
 class Tokenizer:
     def __init__(self, vocab: Dict[int, bytes], merges: List[Tuple[bytes, bytes]], special_tokens: List[str] = None):
         self.vocab = vocab
         self.merges = merges
         self.special_tokens = special_tokens if special_tokens else []
         self.token_to_id = {v: k for k, v in vocab.items()}
-
-        # 建立 Merge 优先级查询表，用于推理时快速查找最小 Rank
         self.merges_rank = {pair: i for i, pair in enumerate(merges)}
-
-        # === 修复点：初始化缓存字典 ===
         self.cache = {}
-
-        # 缓存 Special Token ID
         self.special_token_ids = {}
         for st in self.special_tokens:
             st_bytes = st.encode("utf-8")
@@ -226,7 +318,6 @@ class Tokenizer:
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: List[str] = None):
         with open(vocab_filepath, "r") as f:
             raw_vocab = json.load(f)
-        # JSON key 必须是 string，这里转回 int
         vocab = {int(k): bytes.fromhex(v) for k, v in raw_vocab.items()}
 
         with open(merges_filepath, "r") as f:
@@ -236,17 +327,12 @@ class Tokenizer:
         return cls(vocab, merges, special_tokens)
 
     def _bpe(self, token_bytes: Tuple[bytes, ...]) -> Tuple[bytes, ...]:
-        """
-        对单个预分词 Token 应用 BPE 规则进行合并。
-        """
         word = list(token_bytes)
         while len(word) >= 2:
-            # 统计当前单词内的所有对子
             stats = get_stats({tuple(word): 1})
             pair_to_merge = None
             min_rank = float("inf")
 
-            # 找到 Rank 最小（最早被学习到）的对子
             for pair in stats:
                 if pair in self.merges_rank:
                     rank = self.merges_rank[pair]
@@ -272,7 +358,6 @@ class Tokenizer:
 
     def encode(self, text: str) -> List[int]:
         ids = []
-        # 1. 处理 Special Tokens 切分
         if self.special_re:
             parts = self.special_re.split(text)
         else:
@@ -285,15 +370,12 @@ class Tokenizer:
                 ids.append(self.special_token_ids[part])
                 continue
 
-            # 2. GPT-2 预分词
             pre_tokens = self.gpt2_pat.findall(part)
             for token_str in pre_tokens:
-                # === 优化：查缓存 ===
                 if token_str in self.cache:
                     ids.extend(self.cache[token_str])
                     continue
 
-                # 3. 转换为字节并应用 BPE
                 token_bytes = tuple(bytes([b]) for b in token_str.encode("utf-8"))
                 merged_bytes = self._bpe(token_bytes)
 
@@ -301,19 +383,13 @@ class Tokenizer:
                 for b in merged_bytes:
                     if b in self.token_to_id:
                         current_ids.append(self.token_to_id[b])
-                    else:
-                        pass  # 理论上不应发生
 
-                # === 优化：写入缓存 ===
                 self.cache[token_str] = current_ids
                 ids.extend(current_ids)
 
         return ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        """
-        流式编码，适用于大数据集
-        """
         for chunk in iterable:
             encoded_chunk = self.encode(chunk)
             for token_id in encoded_chunk:
@@ -325,5 +401,4 @@ class Tokenizer:
             if i in self.vocab:
                 byte_parts.append(self.vocab[i])
         combined_bytes = b"".join(byte_parts)
-        # errors="replace" 会将无法解码的字节替换为 U+FFFD
         return combined_bytes.decode("utf-8", errors="replace")
