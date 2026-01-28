@@ -1,8 +1,8 @@
 
 
-# CS336 Assignment 1: 
+# CS336 Assignment 1 Writeup: 
 
-# Section 2 Writeup
+# Section 2 
 
 ## Problem (unicode1): Understanding Unicode
 
