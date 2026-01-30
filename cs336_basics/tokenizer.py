@@ -66,7 +66,21 @@ def train_bpe(
         special_re = None
 
     # === 2. Map 阶段：智能分块读取 ===
-    num_processes = max(1, multiprocessing.cpu_count() - 1)
+    # [修改后] 添加以下逻辑：
+    file_size = os.path.getsize(input_path)
+
+    # 策略：
+    # 1. 如果文件小于 10MB (如测试用的 corpus.en)，强制使用 1 个进程。
+    #    避免在小文件上启动进程池的巨大开销（这直接解决了 1.9s > 1.5s 的问题）。
+    # 2. 即使是大文件，也将最大进程数限制在 16 或 32。
+    #    在 A40 服务器上开启 128 个进程处理文本通常会导致上下文切换瓶颈，反而变慢。
+    if file_size < 10 * 1024 * 1024:  # 10MB
+        num_processes = 1
+    else:
+        # 限制上限为 16 (或者你喜欢的数字，如 8)
+        num_processes = min(max(1, multiprocessing.cpu_count() - 1), 16)
+
+    # 创建 Pool (如果 num_processes=1，开销会非常小)
     pool = multiprocessing.Pool(num_processes)
 
     # 用于累积即将发送给 Worker 的完整片段列表

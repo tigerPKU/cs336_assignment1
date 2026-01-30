@@ -19,8 +19,8 @@ from cs336_basics.tokenizer import train_bpe, Tokenizer
 # 如果没有完整数据，可以用小的 sample 文件代替跑通流程
 # ================= 配置区域 =================
 # 修改为你的实际绝对路径
-TINYSTORIES_PATH = "/root/assignment1-data/TinyStoriesV2-GPT4-train.txt"
-OWT_PATH = "/root/assignment1-data/owt_train.txt"
+TINYSTORIES_PATH = "/home1/jym/sftp/LLM_2026/A1/data/TinyStoriesV2-GPT4-train.txt"
+OWT_PATH = "/home1/jym/sftp/LLM_2026/A1/data/owt_train.txt"
 
 # 输出目录 (保持默认即可，生成的 vocab 和 .npy 会存在你当前项目的 data_preprocessed 文件夹下)
 OUTPUT_DIR = "data_preprocessed"

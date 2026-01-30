@@ -303,11 +303,6 @@ For each parameter, AdamW performs the following element-wise operations:
     $$\text{Time (s)} = \frac{4.03 \times 10^{21}}{9.75 \times 10^{12}} \approx 4.13 \times 10^8 \text{ seconds}$$
     $$\text{Time (days)} = \frac{4.13 \times 10^8}{3600 \times 24} \approx \mathbf{4,784 \text{ days}}$$
 
-*Note: This surprisingly high number illustrates why modern LLM training relies on Tensor Cores (BF16/FP16) which offer ~312 TFLOPs on A100s, rather than the standard Float32 CUDA cores cited in the problem prompt.*
-
-Based on the handout, **Section 5 (Training Loop)** focuses entirely on code implementation and does not contain specific theoretical questions (like "What is the complexity...") that require written answers in the `writeup.pdf`. The "Deliverables" for this section are functions and scripts.
-
-However, it is good practice to include a brief summary of your implementation details in your writeup to demonstrate completion. Below is a structured summary of the Section 5 implementation in Markdown format, which you can copy into your report.
 
 ---
 
@@ -398,13 +393,13 @@ Using the model trained on TinyStories (approx. 5000 steps) with `temperature=0.
 
 To identify the optimal learning rate and understand the stability boundaries of the model, I performed a sweep over the values . The results are analyzed as follows:
 
-1. **Under-confidence ():** The pink curve shows the slowest convergence. By step 5000, the loss is still around **2.1**, significantly higher than well-tuned models. The step size is too small to traverse the loss landscape efficiently within the compute budget.
-2. **Optimal Performance ( & ):**
+1. **Under-confidence :** The pink curve shows the slowest convergence. By step 5000, the loss is still around **2.1**, significantly higher than well-tuned models. The step size is too small to traverse the loss landscape efficiently within the compute budget.
+2. **Optimal Performance :**
 * The **Red** learning rate appears to be the most effective, achieving the fastest initial descent and the lowest final validation loss ( **1.60**).
 * The **(Green)** rate is also highly effective and stable, closely trailing the optimal performance.
 
 
-3. **The Edge of Stability ():**
+3. **The Edge of Stability:**
 * The **(Blue)** curve demonstrates the concept of the "Edge of Stability." While it did not cause the model to diverge to NaN, it performed worse ( 1.7) than the  run.
 * This indicates that the learning rate is slightly too high, preventing the model from settling into the sharpest minima and likely causing it to oscillate around the optimal solution. The optimal rate is found just before this point of degradation.
 
